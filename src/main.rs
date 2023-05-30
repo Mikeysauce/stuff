@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_lambda::{Client, Error};
-use futures::stream;
+use futures::stream::{self, FuturesUnordered};
 use octocrab::{models::repos::Content, params::repos::Reference, Octocrab};
 use serde_json::Value;
 use std::{collections::HashMap, env, str::FromStr};
@@ -55,19 +55,13 @@ async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error
 
     let mut list_functions_page = client.list_functions().into_paginator().send();
 
-    loop {
-        let list_functions = match list_functions_page.next().await {
-            Some(Ok(list_functions)) => list_functions,
-            Some(Err(e)) => return Err(e.into()),
-            None => break,
-        };
-
+    while let Some(list_functions) = list_functions_page.next().await.transpose()? {
         let functions = match list_functions.functions() {
             Some(functions) => functions,
             None => break,
         };
 
-        let mut tasks = Vec::new();
+        let mut tasks = FuturesUnordered::new();
 
         for fnc in functions {
             let task = async move {
@@ -81,9 +75,7 @@ async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error
             tasks.push(task);
         }
 
-        let results = futures::future::join_all(tasks).await;
-
-        for result in results {
+        while let Some(result) = tasks.next().await {
             function_deets.push(result);
         }
 
