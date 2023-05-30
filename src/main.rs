@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_lambda::{Client, Error};
+use futures::stream;
 use octocrab::{models::repos::Content, params::repos::Reference, Octocrab};
 use serde_json::Value;
 use std::{collections::HashMap, env, str::FromStr};
+use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> octocrab::Result<(), anyhow::Error> {
@@ -48,49 +50,47 @@ struct Lambda {
 }
 
 async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error> {
-    let mut next_marker: Option<String> = None;
     let mut total_functions = 0;
     let mut function_deets: Vec<Lambda> = Vec::new();
 
+    let mut list_functions_page = client.list_functions().into_paginator().send();
+
     loop {
-        let mut request = client.list_functions();
-        if let Some(marker) = &next_marker {
-            request = request.marker(marker);
-        }
-        let resp = request.send().await?;
-        let resp_functions = resp.functions.unwrap_or_default();
-        total_functions += resp_functions.len();
+        let list_functions = match list_functions_page.next().await {
+            Some(Ok(list_functions)) => list_functions,
+            Some(Err(e)) => return Err(e.into()),
+            None => break,
+        };
 
-        let functions = resp_functions
-            .iter()
-            .filter(|fnc| fnc.environment().is_some())
-            .map(|func| {
-                let env_vars = func.environment().unwrap().variables().unwrap().clone();
-                let name = func.function_name().unwrap().to_string();
-                let arn = func.function_arn().unwrap().to_string();
+        let functions = match list_functions.functions() {
+            Some(functions) => functions,
+            None => break,
+        };
+
+        let mut tasks = Vec::new();
+
+        for fnc in functions {
+            let task = async move {
                 Lambda {
-                    name,
-                    env_vars,
-                    arn,
+                    name: fnc.function_name().unwrap().to_string(),
+                    env_vars: HashMap::new(),
+                    arn: fnc.function_arn().unwrap().to_string(),
                 }
-            });
+            };
 
-        function_deets.extend(functions);
-
-        if let Some(marker) = resp.next_marker {
-            next_marker = Some(marker);
-        } else {
-            break;
+            tasks.push(task);
         }
+
+        let results = futures::future::join_all(tasks).await;
+
+        for result in results {
+            function_deets.push(result);
+        }
+
+        total_functions += functions.len();
     }
 
-    if total_functions > 0 {
-        println!(
-            "Filtered {} function(s) down to {}",
-            total_functions,
-            function_deets.len()
-        );
-    }
+    println!("Total functions: {}", total_functions);
 
     Ok(function_deets)
 }
