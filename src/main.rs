@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_lambda::{Client, Error};
-use futures::stream::{self, FuturesUnordered};
+use futures::stream;
 use octocrab::{models::repos::Content, params::repos::Reference, Octocrab};
 use serde_json::Value;
-use std::{collections::HashMap, env, str::FromStr};
+use std::{collections::HashMap, env, str::FromStr, time::Instant};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -14,31 +14,35 @@ async fn main() -> octocrab::Result<(), anyhow::Error> {
     });
 
     let config = aws_config::load_from_env().await;
-
     let aws_client = Client::new(&config);
+    let start = Instant::now();
 
-    let details = match fetch_packagejson_details(token).await {
-        Ok(details) => details,
-        Err(e) => {
-            println!("Failed to get package.json details: {}", e);
-            return Ok(());
-        }
-    };
+    // let details = match fetch_packagejson_details(token).await {
+    //     Ok(details) => details,
+    //     Err(e) => {
+    //         println!("Failed to get package.json details: {}", e);
+    //         return Ok(());
+    //     }
+    // };
 
     let deployed_lambdas = get_deployed_lambdas_list(&aws_client).await?;
+    let got_lambdas = start.elapsed();
+    println!("Got lambdas in {:?}", got_lambdas);
 
-    for (name, version) in details {
-        if let Some(fnc) = deployed_lambdas.iter().find(|fnc| fnc.name.contains(&name)) {
-            println!("-------------------------------------");
-            println!("Function: {}", fnc.name);
-            println!("ARN: {}", fnc.arn);
-            println!("Environment variables: {:#?}", fnc.env_vars);
-            println!("Package.json version: {}", version);
-            println!("-------------------------------------");
-        } else {
-            println!("Function with name {} not found", name);
-        }
-    }
+    println!("Deployed lambdas: {:#?}", deployed_lambdas);
+
+    // for (name, version) in details {
+    //     if let Some(fnc) = deployed_lambdas.iter().find(|fnc| fnc.name.contains(&name)) {
+    //         println!("-------------------------------------");
+    //         println!("Function: {}", fnc.name);
+    //         println!("ARN: {}", fnc.arn);
+    //         println!("Environment variables: {:#?}", fnc.env_vars);
+    //         println!("Package.json version: {}", version);
+    //         println!("-------------------------------------");
+    //     } else {
+    //         println!("Function with name {} not found", name);
+    //     }
+    // }
 
     Ok(())
 }
@@ -49,40 +53,29 @@ struct Lambda {
     arn: String,
 }
 
-async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error> {
-    let mut total_functions = 0;
-    let mut function_deets: Vec<Lambda> = Vec::new();
+async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<String>, Error> {
+    let mut function_deets: Vec<String> = Vec::new();
 
-    let mut list_functions_page = client.list_functions().into_paginator().send();
+    let mut list_functions_page = client.list_functions().into_paginator().items().send();
 
-    while let Some(list_functions) = list_functions_page.next().await.transpose()? {
-        let functions = match list_functions.functions() {
-            Some(functions) => functions,
-            None => break,
-        };
-
-        let mut tasks = FuturesUnordered::new();
-
-        for fnc in functions {
-            let task = async move {
-                Lambda {
-                    name: fnc.function_name().unwrap().to_string(),
-                    env_vars: HashMap::new(),
-                    arn: fnc.function_arn().unwrap().to_string(),
+    while let Some(list_functions) = list_functions_page.next().await {
+        let tasks = list_functions
+            .into_iter()
+            .filter_map(|func| {
+                if func.environment().is_some() {
+                    Some(async move { func.function_name.as_ref().unwrap().to_string() })
+                } else {
+                    None
                 }
-            };
+            })
+            .collect::<Vec<_>>();
 
-            tasks.push(task);
-        }
+        let results = futures::future::join_all(tasks).await;
 
-        while let Some(result) = tasks.next().await {
+        for result in results {
             function_deets.push(result);
         }
-
-        total_functions += functions.len();
     }
-
-    println!("Total functions: {}", total_functions);
 
     Ok(function_deets)
 }
