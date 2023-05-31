@@ -1,11 +1,10 @@
 use anyhow::{anyhow, Result};
 use aws_sdk_lambda::{Client, Error};
-use futures::stream;
+use futures::{stream, StreamExt};
 use octocrab::{models::repos::Content, params::repos::Reference, Octocrab};
+use rayon::prelude::*;
 use serde_json::Value;
 use std::{collections::HashMap, env, str::FromStr, time::Instant};
-use tokio_stream::StreamExt;
-use rayon::prelude::*;
 
 #[tokio::main]
 async fn main() -> octocrab::Result<(), anyhow::Error> {
@@ -55,44 +54,42 @@ struct Lambda {
     arn: String,
 }
 
+impl IntoIterator for Lambda {
+    type Item = Lambda;
+    type IntoIter = std::vec::IntoIter<Lambda>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        vec![self].into_iter()
+    }
+}
+
 async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error> {
     let mut function_deets: Vec<Lambda> = Vec::new();
 
-    let mut list_functions_page = client.list_functions().into_paginator().items().send();
+    let list_functions_page = client.list_functions().into_paginator().items().send();
 
-    while let Some(list_functions) = list_functions_page.next().await {
-        let tasks = list_functions
-            .into_par_iter() // Use `into_par_iter` to process items in parallel
-            .filter_map(|func| {
-                if func.environment().is_some() {
-                    Some(async move {
-                        Lambda {
-                            name: func.function_name.as_ref().unwrap().to_string(),
-                            env_vars: func
-                                .environment()
-                                .as_ref()
-                                .unwrap()
-                                .variables()
-                                .unwrap()
-                                .clone(),
-                            arn: func.function_arn.unwrap_or_default(),
-                        }
-                    })
+    let mut tasks = list_functions_page
+        .map(|mut page| {
+            let client = client.clone();
+            async move {
+                let page = page?;
+                if let Some(env_vars) = page.environment() {
+                    let lambda = Lambda {
+                        name: page.function_name().unwrap_or_default().to_string(),
+                        env_vars: env_vars.variables.as_ref().unwrap().clone(),
+                        arn: page.function_arn().unwrap_or_default().to_string(),
+                    };
+                    Ok(lambda)
                 } else {
-                    None
+                    Err(anyhow!("Failed to get environment variables for function {}", page.function_name().unwrap_or_default()))
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+        })
+        .buffer_unordered(10);
 
-        let mut results = Vec::new();
-
-        for task in tasks {
-            let result = tokio::task::spawn_blocking(|| task).await.unwrap().await;
-            results.push(result);
+        while let Some(task) = tasks.next().await {
+            function_deets.extend(task);
         }
-
-        function_deets.extend(results);
-    }
 
     Ok(function_deets)
 }
