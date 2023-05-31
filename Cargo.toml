@@ -18,3 +18,4 @@ openssl = { version = "0.10.52" }
 aws-sdk-lambda = "0.28.0"
 aws-config = "0.55.3"
 futures = "0.3.28"
+rayon = "1.7.0"

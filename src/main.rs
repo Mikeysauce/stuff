@@ -5,6 +5,7 @@ use octocrab::{models::repos::Content, params::repos::Reference, Octocrab};
 use serde_json::Value;
 use std::{collections::HashMap, env, str::FromStr, time::Instant};
 use tokio_stream::StreamExt;
+use rayon::prelude::*;
 
 #[tokio::main]
 async fn main() -> octocrab::Result<(), anyhow::Error> {
@@ -61,7 +62,7 @@ async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error
 
     while let Some(list_functions) = list_functions_page.next().await {
         let tasks = list_functions
-            .into_iter()
+            .into_par_iter() // Use `into_par_iter` to process items in parallel
             .filter_map(|func| {
                 if func.environment().is_some() {
                     Some(async move {
@@ -86,7 +87,7 @@ async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error
         let mut results = Vec::new();
 
         for task in tasks {
-            let result = tokio::task::block_in_place(|| task).await;
+            let result = tokio::task::spawn_blocking(|| task).await.unwrap().await;
             results.push(result);
         }
 
