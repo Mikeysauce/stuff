@@ -47,14 +47,15 @@ async fn main() -> octocrab::Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct Lambda {
     name: String,
     env_vars: HashMap<String, String>,
     arn: String,
 }
 
-async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<String>, Error> {
-    let mut function_deets: Vec<String> = Vec::new();
+async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<Lambda>, Error> {
+    let mut function_deets: Vec<Lambda> = Vec::new();
 
     let mut list_functions_page = client.list_functions().into_paginator().items().send();
 
@@ -63,18 +64,33 @@ async fn get_deployed_lambdas_list(client: &Client) -> Result<Vec<String>, Error
             .into_iter()
             .filter_map(|func| {
                 if func.environment().is_some() {
-                    Some(async move { func.function_name.as_ref().unwrap().to_string() })
+                    Some(async move {
+                        Lambda {
+                            name: func.function_name.as_ref().unwrap().to_string(),
+                            env_vars: func
+                                .environment()
+                                .as_ref()
+                                .unwrap()
+                                .variables()
+                                .unwrap()
+                                .clone(),
+                            arn: func.function_arn.unwrap_or_default(),
+                        }
+                    })
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
 
-        let results = futures::future::join_all(tasks).await;
+        let mut results = Vec::new();
 
-        for result in results {
-            function_deets.push(result);
+        for task in tasks {
+            let result = tokio::task::block_in_place(|| task).await;
+            results.push(result);
         }
+
+        function_deets.extend(results);
     }
 
     Ok(function_deets)
